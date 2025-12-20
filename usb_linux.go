@@ -10,7 +10,9 @@ package infnoise
 import "C"
 
 import (
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 	"unsafe"
 )
@@ -27,11 +29,10 @@ const (
 	reqOutVendor = 0x40
 
 	defaultTimeoutMS = 5000
-	defaultIface     = 0
 	epInAddr         = 0x81
 	epOutAddr        = 0x02
 
-	transferChunk = 512
+	ringBufferSize = 64 * 1024
 )
 
 type usbHandle struct {
@@ -44,16 +45,26 @@ type usbHandle struct {
 
 	maxPacket int
 
-	rawBuf []byte
-	rxBuf  []byte
+	mu     sync.Mutex
+	cond   *sync.Cond
+	closed bool
+	wg     sync.WaitGroup
+
+	rBuf  []byte
+	rHead int
+	rTail int
+	count int
 }
 
 func openUSB(vid, pid uint16) (*usbHandle, error) {
 	h := &usbHandle{
-		iface: defaultIface,
+		iface: 0,
 		epIn:  C.uchar(epInAddr),
 		epOut: C.uchar(epOutAddr),
+		rBuf:  make([]byte, ringBufferSize),
 	}
+
+	h.cond = sync.NewCond(&h.mu)
 
 	st := C.libusb_init(&h.ctx)
 	if st != 0 {
@@ -93,10 +104,6 @@ func openUSB(vid, pid uint16) (*usbHandle, error) {
 		}
 	}
 
-	h.rawBuf = make([]byte, 4096)
-
-	h.rxBuf = make([]byte, 0, 64*1024)
-
 	h.ctrlOut(sioReset, sioResetSio)
 	h.ctrlOut(sioReset, sioPurgeRx)
 	h.ctrlOut(sioReset, sioPurgeTx)
@@ -105,12 +112,15 @@ func openUSB(vid, pid uint16) (*usbHandle, error) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	err := h.setBaudRate(30000)
+	err = h.setBaudRate(30000)
 	if err != nil {
 		h.close()
-
 		return nil, err
 	}
+
+	h.wg.Add(1)
+
+	go h.readerLoop()
 
 	return h, nil
 }
@@ -123,30 +133,32 @@ func (h *usbHandle) setBitMode(mask byte, mode byte) error {
 		return err
 	}
 
+	h.mu.Lock()
+
 	h.ctrlOut(sioReset, sioPurgeRx)
 	h.ctrlOut(sioReset, sioPurgeTx)
 
-	h.rxBuf = h.rxBuf[:0]
+	h.rHead = 0
+	h.rTail = 0
+	h.count = 0
+
+	h.mu.Unlock()
 
 	return nil
 }
 
 func (h *usbHandle) write(data []byte) error {
-	if len(data) > 0 && len(h.rxBuf) > 0 {
-		h.rxBuf = h.rxBuf[:0]
-	}
+	var total int
 
-	for off := 0; off < len(data); off += transferChunk {
-		end := min(off+transferChunk, len(data))
-
-		chunkLen := end - off
-
+	for total < len(data) {
 		var xfer C.int
+
+		toWrite := len(data) - total
 
 		st := C.libusb_bulk_transfer(
 			h.devh, h.epOut,
-			(*C.uchar)(unsafe.Pointer(&data[off])),
-			C.int(chunkLen),
+			(*C.uchar)(unsafe.Pointer(&data[total])),
+			C.int(toWrite),
 			&xfer,
 			defaultTimeoutMS,
 		)
@@ -155,80 +167,144 @@ func (h *usbHandle) write(data []byte) error {
 			return usbErr(st)
 		}
 
-		neededPayload := chunkLen
-
-		for neededPayload > 0 {
-			st = C.libusb_bulk_transfer(
-				h.devh, h.epIn,
-				(*C.uchar)(unsafe.Pointer(&h.rawBuf[0])),
-				C.int(len(h.rawBuf)),
-				&xfer,
-				defaultTimeoutMS,
-			)
-
-			if st != 0 {
-				return usbErr(st)
-			}
-
-			nRaw := int(xfer)
-			if nRaw == 0 {
-				continue
-			}
-
-			payloadBytes := h.extractPayload(h.rawBuf[:nRaw])
-
-			h.rxBuf = append(h.rxBuf, payloadBytes...)
-
-			neededPayload -= len(payloadBytes)
+		if xfer <= 0 {
+			return fmt.Errorf("short write: %d", xfer)
 		}
+
+		total += int(xfer)
 	}
 
 	return nil
 }
 
 func (h *usbHandle) read(dst []byte) error {
-	if len(dst) == 0 {
-		return nil
-	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
-	if len(h.rxBuf) < len(dst) {
-		return fmt.Errorf("read underrun: want %d bytes, have %d (device sync lost?)", len(dst), len(h.rxBuf))
-	}
+	totalRead := 0
 
-	copy(dst, h.rxBuf[:len(dst)])
+	for totalRead < len(dst) {
+		for h.count == 0 {
+			if h.closed {
+				return errors.New("usb device closed")
+			}
 
-	if len(dst) == len(h.rxBuf) {
-		h.rxBuf = h.rxBuf[:0]
-	} else {
-		copy(h.rxBuf, h.rxBuf[len(dst):])
-		h.rxBuf = h.rxBuf[:len(h.rxBuf)-len(dst)]
+			h.cond.Wait()
+		}
+
+		available := h.count
+		end := min(h.rTail+available, len(h.rBuf))
+		contiguous := end - h.rTail
+
+		needed := len(dst) - totalRead
+		toCopy := min(contiguous, needed)
+
+		copy(dst[totalRead:], h.rBuf[h.rTail:h.rTail+toCopy])
+
+		h.rTail = (h.rTail + toCopy) % len(h.rBuf)
+
+		h.count -= toCopy
+		totalRead += toCopy
 	}
 
 	return nil
 }
 
-func (h *usbHandle) extractPayload(raw []byte) []byte {
-	if len(raw) < 2 {
-		return nil
-	}
+func (h *usbHandle) readerLoop() {
+	defer h.wg.Done()
 
+	scratch := make([]byte, 4096)
 	mps := h.maxPacket
-	dest := raw[:0]
 
-	for off := 0; off < len(raw); off += mps {
-		chunkEnd := min(off+mps, len(raw))
+	for {
+		var xfer C.int
 
-		if chunkEnd-off <= 2 {
+		st := C.libusb_bulk_transfer(
+			h.devh, h.epIn,
+			(*C.uchar)(unsafe.Pointer(&scratch[0])),
+			C.int(len(scratch)),
+			&xfer,
+			100,
+		)
+
+		if st == C.LIBUSB_ERROR_TIMEOUT {
+			h.mu.Lock()
+
+			if h.closed {
+				h.mu.Unlock()
+
+				return
+			}
+
+			h.mu.Unlock()
+
+			continue
+		}
+		if st != 0 {
+			h.mu.Lock()
+
+			h.closed = true
+			h.cond.Broadcast()
+
+			h.mu.Unlock()
+
+			return
+		}
+
+		n := int(xfer)
+		if n <= 0 {
 			continue
 		}
 
-		dest = append(dest, raw[off+2:chunkEnd]...)
-	}
+		h.mu.Lock()
+		if h.closed {
+			h.mu.Unlock()
 
-	return dest
+			return
+		}
+
+		for i := 0; i < n; i += mps {
+			pktEnd := min(i+mps, n)
+
+			if pktEnd-i > 2 {
+				payload := scratch[i+2 : pktEnd]
+				pLen := len(payload)
+
+				if h.count+pLen <= len(h.rBuf) {
+					end := h.rHead + pLen
+
+					if end <= len(h.rBuf) {
+						copy(h.rBuf[h.rHead:], payload)
+					} else {
+						firstPart := len(h.rBuf) - h.rHead
+
+						copy(h.rBuf[h.rHead:], payload[:firstPart])
+						copy(h.rBuf[0:], payload[firstPart:])
+					}
+
+					h.rHead = (h.rHead + pLen) % len(h.rBuf)
+					h.count += pLen
+				}
+			}
+		}
+
+		h.cond.Signal()
+		h.mu.Unlock()
+	}
 }
 
 func (h *usbHandle) close() error {
+	h.mu.Lock()
+
+	if !h.closed {
+		h.closed = true
+		h.cond.Broadcast()
+	}
+
+	h.mu.Unlock()
+
+	h.wg.Wait()
+
 	if h.devh != nil {
 		h.ctrlOut(sioSetBitMode, 0)
 
@@ -266,6 +342,10 @@ func (h *usbHandle) setBaudRate(baud int) error {
 	div := uint16(3000000 / baud)
 
 	return h.ctrlOut(sioSetBaudRate, div)
+}
+
+func (h *usbHandle) setLatencyTimer(ms byte) error {
+	return h.ctrlOut(sioSetLatency, uint16(ms))
 }
 
 func usbErr(st C.int) error {
