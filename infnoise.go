@@ -25,8 +25,7 @@ const (
 	BufLen  = 512
 	IOBatch = BufLen * 64
 
-	RawChunkSize      = 64
-	WhitenedChunkSize = 32
+	WhitenedChunkSize = 2048
 )
 
 // Device represents a connection to an Infinite Noise TRNG hardware unit.
@@ -36,25 +35,28 @@ type Device struct {
 	running bool
 
 	outPattern []byte
+	outBulk    []byte
+	inBulk     []byte
 
-	outBulk []byte
-	inBulk  []byte
+	sponge sha3.ShakeHash
 
-	sponge  sha3.ShakeHash
-	pool    []byte
-	rawPool []byte
+	pool        []byte
+	poolBuf     []byte
+	rawPool     []byte
+	rawFetchBuf []byte
 }
 
 // New initializes a new Infinite Noise device with default internal buffers.
 func New() *Device {
 	d := &Device{
 		outPattern: make([]byte, BufLen),
+		outBulk:    make([]byte, IOBatch),
+		inBulk:     make([]byte, IOBatch),
 
-		outBulk: make([]byte, IOBatch),
-		inBulk:  make([]byte, IOBatch),
-
-		sponge:  sha3.NewCShake256(nil, []byte("infnoise")),
-		rawPool: make([]byte, 0, RawChunkSize),
+		sponge:      sha3.NewCShake256(nil, []byte("infnoise")),
+		poolBuf:     make([]byte, WhitenedChunkSize),
+		rawPool:     make([]byte, 0, WhitenedChunkSize),
+		rawFetchBuf: make([]byte, WhitenedChunkSize),
 	}
 
 	for i := range BufLen {
@@ -107,6 +109,7 @@ func (d *Device) Read(p []byte) (n int, err error) {
 	}
 
 	for n < len(p) {
+		// 1. Drain whitened pool
 		if len(d.pool) > 0 {
 			todo := min(len(d.pool), len(p)-n)
 
@@ -118,27 +121,24 @@ func (d *Device) Read(p []byte) (n int, err error) {
 			continue
 		}
 
-		rawReq := RawChunkSize - len(d.rawPool)
-		rawBuf := make([]byte, rawReq)
+		rawNeeded := WhitenedChunkSize - len(d.rawPool)
+		if rawNeeded > 0 {
+			rn, rerr := d.readRawLocked(d.rawFetchBuf[:rawNeeded])
+			if rerr != nil {
+				return n, rerr
+			}
 
-		rn, rerr := d.readRawLocked(rawBuf)
-		if rerr != nil {
-			return n, rerr
+			d.rawPool = append(d.rawPool, d.rawFetchBuf[:rn]...)
 		}
 
-		d.rawPool = append(d.rawPool, rawBuf[:rn]...)
-
-		if len(d.rawPool) >= RawChunkSize {
-			d.sponge.Write(d.rawPool[:RawChunkSize])
+		if len(d.rawPool) >= WhitenedChunkSize {
+			d.sponge.Write(d.rawPool[:WhitenedChunkSize])
 
 			clone := d.sponge.Clone()
+			clone.Read(d.poolBuf)
 
-			out := make([]byte, WhitenedChunkSize)
-
-			clone.Read(out)
-
-			d.pool = out
-			d.rawPool = d.rawPool[RawChunkSize:]
+			d.rawPool = d.rawPool[:0]
+			d.pool = d.poolBuf
 		}
 	}
 

@@ -60,6 +60,13 @@ pkg: github.com/coalaura/infnoise
 cpu: AMD Ryzen 9 9950X3D 16-Core Processor
 BenchmarkReadRawThroughput
 BenchmarkReadRawThroughput-32                  1        4394838500 ns/op            59.65 KB/s             477.2 Kbps            4608 B/op        256 allocs/op
+
+goos: windows
+goarch: amd64
+pkg: github.com/coalaura/infnoise
+cpu: AMD Ryzen 9 9950X3D 16-Core Processor
+BenchmarkReadThroughput
+BenchmarkReadThroughput-32             1        4410143800 ns/op            59.44 KB/s             475.5 Kbps         142352 B/op       1408 allocs/op
 ```
 
 ### WSL 2
@@ -70,4 +77,11 @@ pkg: github.com/coalaura/infnoise
 cpu: AMD Ryzen 9 9950X3D 16-Core Processor
 BenchmarkReadRawThroughput
 BenchmarkReadRawThroughput-32                  1        4419927471 ns/op            59.31 KB/s             474.5 Kbps          14512 B/op       3277 allocs/op
+
+goos: linux
+goarch: amd64
+pkg: github.com/coalaura/infnoise
+cpu: AMD Ryzen 9 9950X3D 16-Core Processor
+BenchmarkReadThroughput
+BenchmarkReadThroughput-32             1        4461144940 ns/op            58.76 KB/s             470.1 Kbps         146288 B/op       4001 allocs/op
 ```
