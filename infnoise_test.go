@@ -7,7 +7,7 @@ import (
 
 const (
 	testBytes = 32 * 1024
-	testChunk = 1 << 20 // 1 MiB
+	testChunk = 256 * 1024 // 256 KiB
 )
 
 func openDevice(t testing.TB) *Device {
@@ -93,9 +93,6 @@ func BenchmarkReadRawThroughput(b *testing.B) {
 
 	buf := make([]byte, testChunk)
 
-	b.ReportAllocs()
-	b.SetBytes(testChunk)
-
 	for range 3 {
 		n, err := dv.ReadRaw(buf)
 		if err != nil {
@@ -106,6 +103,10 @@ func BenchmarkReadRawThroughput(b *testing.B) {
 			b.Fatalf("read only %d raw bytes, want %d", n, len(buf))
 		}
 	}
+
+	b.ReportAllocs()
+	b.SetBytes(testChunk)
+	b.ResetTimer()
 
 	for b.Loop() {
 		n, err := dv.ReadRaw(buf)
@@ -121,10 +122,15 @@ func BenchmarkReadRawThroughput(b *testing.B) {
 	b.StopTimer()
 
 	sec := b.Elapsed().Seconds()
-	if sec > 0 {
-		total := float64(int64(b.N) * testChunk)
-
-		b.ReportMetric(total/1e6/sec, "MB/s")
-		b.ReportMetric(total/(1024*1024)/sec, "MiB/s")
+	if sec <= 0 {
+		return
 	}
+
+	totalBytes := float64(int64(b.N) * testChunk)
+
+	kBps := (totalBytes / 1000.0) / sec
+	kbps := (totalBytes * 8.0 / 1000.0) / sec
+
+	b.ReportMetric(kBps, "KB/s")
+	b.ReportMetric(kbps, "Kbps")
 }
