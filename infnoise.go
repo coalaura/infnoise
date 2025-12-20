@@ -94,7 +94,7 @@ func (d *Device) ReadRaw(p []byte) (n int, err error) {
 		for i := 0; i < BufLen/8 && n < len(p); i++ {
 			var b uint8
 
-			for j := 0; j < 8; j++ {
+			for j := range 8 {
 				val := inBuf[i*8+j]
 
 				evenBit := (val >> COMP2) & 1 // COMP2
