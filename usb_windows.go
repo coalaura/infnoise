@@ -25,8 +25,6 @@ var (
 	pFT_SetLatencyTimer  = ftd2xx.NewProc("FT_SetLatencyTimer")
 	pFT_SetBaudRate      = ftd2xx.NewProc("FT_SetBaudRate")
 	pFT_SetBitMode       = ftd2xx.NewProc("FT_SetBitMode")
-	pFT_GetBitMode       = ftd2xx.NewProc("FT_GetBitMode")
-	pFT_GetQueueStatus   = ftd2xx.NewProc("FT_GetQueueStatus")
 
 	pFT_Write = ftd2xx.NewProc("FT_Write")
 	pFT_Read  = ftd2xx.NewProc("FT_Read")
@@ -39,7 +37,6 @@ const (
 	FT_PURGE_TX = 2
 
 	FT_OPEN_BY_SERIAL_NUMBER = 1
-	FT_OPEN_BY_DESCRIPTION   = 2
 
 	FT_FLOW_NONE = 0x0000
 )
@@ -169,17 +166,6 @@ func (h *usbHandle) setBitMode(mask byte, mode byte) error {
 	return nil
 }
 
-func (h *usbHandle) getBitMode() (byte, error) {
-	var b byte
-
-	st, _, _ := pFT_GetBitMode.Call(h.ftHandle, uintptr(unsafe.Pointer(&b)))
-	if st != FT_OK {
-		return 0, fmt.Errorf("FT_GetBitMode failed: %d", st)
-	}
-
-	return b, nil
-}
-
 func (h *usbHandle) write(data []byte) error {
 	return h.writeExact(data)
 }
@@ -218,33 +204,14 @@ func (h *usbHandle) readExact(data []byte) error {
 		return nil
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-
 	var total int
 
 	for total < len(data) {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("FT_Read timeout: got %d, want %d", total, len(data))
-		}
-
-		var q uint32
-
-		st, _, _ := pFT_GetQueueStatus.Call(h.ftHandle, uintptr(unsafe.Pointer(&q)))
-		if st != FT_OK {
-			return fmt.Errorf("FT_GetQueueStatus failed: %d", st)
-		}
-
-		if q == 0 {
-			time.Sleep(1 * time.Millisecond)
-
-			continue
-		}
-
-		need := min(int(q), len(data)-total)
+		need := len(data) - total
 
 		var got uint32
 
-		st, _, _ = pFT_Read.Call(
+		st, _, _ := pFT_Read.Call(
 			h.ftHandle,
 			uintptr(unsafe.Pointer(&data[total])),
 			uintptr(need),
@@ -253,6 +220,10 @@ func (h *usbHandle) readExact(data []byte) error {
 
 		if st != FT_OK {
 			return fmt.Errorf("FT_Read failed: %d", st)
+		}
+
+		if got == 0 {
+			return fmt.Errorf("FT_Read timeout/stall: got %d, want %d", total, len(data))
 		}
 
 		total += int(got)
