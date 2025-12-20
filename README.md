@@ -51,3 +51,23 @@ func main() {
 Tested on AMD Ryzen 9 9950X3D:
 - **Throughput**: ~60 KB/s (almost hardware limit)
 - **Latency**: ~2ms (configured via LatencyTimer)
+
+### Windows 11
+```
+goos: windows
+goarch: amd64
+pkg: github.com/coalaura/infnoise
+cpu: AMD Ryzen 9 9950X3D 16-Core Processor
+BenchmarkReadRawThroughput
+BenchmarkReadRawThroughput-32                  1        4394838500 ns/op            59.65 KB/s             477.2 Kbps            4608 B/op        256 allocs/op
+```
+
+### WSL 2
+```
+goos: linux
+goarch: amd64
+pkg: github.com/coalaura/infnoise
+cpu: AMD Ryzen 9 9950X3D 16-Core Processor
+BenchmarkReadRawThroughput
+BenchmarkReadRawThroughput-32                  1        4419927471 ns/op            59.31 KB/s             474.5 Kbps          14512 B/op       3277 allocs/op
+```
