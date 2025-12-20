@@ -3,6 +3,8 @@ package infnoise
 import (
 	"errors"
 	"sync"
+
+	"golang.org/x/crypto/sha3"
 )
 
 const (
@@ -22,8 +24,12 @@ const (
 
 	BufLen  = 512
 	IOBatch = BufLen * 64
+
+	RawChunkSize      = 64
+	WhitenedChunkSize = 32
 )
 
+// Device represents a connection to an Infinite Noise TRNG hardware unit.
 type Device struct {
 	mu      sync.Mutex
 	usbDev  *usbHandle
@@ -33,13 +39,22 @@ type Device struct {
 
 	outBulk []byte
 	inBulk  []byte
+
+	sponge  sha3.ShakeHash
+	pool    []byte
+	rawPool []byte
 }
 
+// New initializes a new Infinite Noise device with default internal buffers.
 func New() *Device {
 	d := &Device{
 		outPattern: make([]byte, BufLen),
-		outBulk:    make([]byte, IOBatch),
-		inBulk:     make([]byte, IOBatch),
+
+		outBulk: make([]byte, IOBatch),
+		inBulk:  make([]byte, IOBatch),
+
+		sponge:  sha3.NewCShake256(nil, []byte("infnoise")),
+		rawPool: make([]byte, 0, RawChunkSize),
 	}
 
 	for i := range BufLen {
@@ -59,6 +74,7 @@ func New() *Device {
 	return d
 }
 
+// Start opens the USB connection and initializes the device into synchronous bitbang mode.
 func (d *Device) Start() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -81,11 +97,81 @@ func (d *Device) Start() error {
 	return nil
 }
 
-// ReadRaw fills p with RAW bytes extracted from COMP2/COMP1.
+// Read implements io.Reader, filling p with cryptographically whitened entropy.
+func (d *Device) Read(p []byte) (n int, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if !d.running {
+		return 0, errors.New("device not started")
+	}
+
+	for n < len(p) {
+		if len(d.pool) > 0 {
+			todo := min(len(d.pool), len(p)-n)
+
+			copy(p[n:], d.pool[:todo])
+			d.pool = d.pool[todo:]
+
+			n += todo
+
+			continue
+		}
+
+		rawReq := RawChunkSize - len(d.rawPool)
+		rawBuf := make([]byte, rawReq)
+
+		rn, rerr := d.readRawLocked(rawBuf)
+		if rerr != nil {
+			return n, rerr
+		}
+
+		d.rawPool = append(d.rawPool, rawBuf[:rn]...)
+
+		if len(d.rawPool) >= RawChunkSize {
+			d.sponge.Write(d.rawPool[:RawChunkSize])
+
+			clone := d.sponge.Clone()
+
+			out := make([]byte, WhitenedChunkSize)
+
+			clone.Read(out)
+
+			d.pool = out
+			d.rawPool = d.rawPool[RawChunkSize:]
+		}
+	}
+
+	return n, nil
+}
+
+// ReadRaw fills p with the direct, unwhitened bitstream from the hardware.
 func (d *Device) ReadRaw(p []byte) (n int, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	return d.readRawLocked(p)
+}
+
+// Close stops the device and releases the underlying USB handle.
+func (d *Device) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.running = false
+
+	if d.usbDev != nil {
+		err := d.usbDev.close()
+
+		d.usbDev = nil
+
+		return err
+	}
+
+	return nil
+}
+
+func (d *Device) readRawLocked(p []byte) (n int, err error) {
 	if !d.running {
 		return 0, errors.New("device not started")
 	}
@@ -140,23 +226,6 @@ func (d *Device) ReadRaw(p []byte) (n int, err error) {
 	}
 
 	return n, nil
-}
-
-func (d *Device) Close() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	d.running = false
-
-	if d.usbDev != nil {
-		err := d.usbDev.close()
-
-		d.usbDev = nil
-
-		return err
-	}
-
-	return nil
 }
 
 func makeAddress(addr uint8) uint8 {
