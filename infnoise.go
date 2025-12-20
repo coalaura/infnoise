@@ -18,30 +18,42 @@ const (
 
 	// All bits are outputs except COMP1 and COMP2.
 	// 0xFF &~(1<<1) &~(1<<4) == 0xED
-	Mask   = 0xED
-	BufLen = 512
+	Mask = 0xED
+
+	BufLen  = 512
+	IOBatch = BufLen * 64
 )
 
 type Device struct {
 	mu      sync.Mutex
 	usbDev  *usbHandle
-	outBuf  []byte
 	running bool
+
+	outPattern []byte
+
+	outBulk []byte
+	inBulk  []byte
 }
 
 func New() *Device {
 	d := &Device{
-		outBuf: make([]byte, BufLen),
+		outPattern: make([]byte, BufLen),
+		outBulk:    make([]byte, IOBatch),
+		inBulk:     make([]byte, IOBatch),
 	}
 
 	for i := range BufLen {
 		if i&1 == 1 {
-			d.outBuf[i] = (1 << SWEN2)
+			d.outPattern[i] = (1 << SWEN2)
 		} else {
-			d.outBuf[i] = (1 << SWEN1)
+			d.outPattern[i] = (1 << SWEN1)
 		}
 
-		d.outBuf[i] |= makeAddress(uint8(i & 0x0f))
+		d.outPattern[i] |= makeAddress(uint8(i & 0x0f))
+	}
+
+	for off := 0; off < len(d.outBulk); off += BufLen {
+		copy(d.outBulk[off:off+BufLen], d.outPattern)
 	}
 
 	return d
@@ -78,42 +90,53 @@ func (d *Device) ReadRaw(p []byte) (n int, err error) {
 		return 0, errors.New("device not started")
 	}
 
-	inBuf := make([]byte, BufLen)
-
 	for n < len(p) {
-		err := d.usbDev.write(d.outBuf)
+		needOut := len(p) - n
+
+		needIn := min(needOut*8, len(d.inBulk))
+
+		needIn &= ^7
+		if needIn == 0 {
+			return n, nil
+		}
+
+		err := d.usbDev.write(d.outBulk[:needIn])
 		if err != nil {
 			return n, err
 		}
 
-		err = d.usbDev.read(inBuf)
+		err = d.usbDev.read(d.inBulk[:needIn])
 		if err != nil {
 			return n, err
 		}
 
-		for i := 0; i < BufLen/8 && n < len(p); i++ {
+		outCount := min(needIn/8, needOut)
+
+		in := d.inBulk[:needIn]
+		out := p[n : n+outCount]
+
+		for i := range outCount {
+			base := i * 8
+
 			var b uint8
 
 			for j := range 8 {
-				val := inBuf[i*8+j]
+				val := in[base+j]
 
-				evenBit := (val >> COMP2) & 1 // COMP2
-				oddBit := (val >> COMP1) & 1  // COMP1
-
-				var bit uint8
+				evenBit := (val >> COMP2) & 1
+				oddBit := (val >> COMP1) & 1
 
 				if (j & 1) == 1 {
-					bit = oddBit
+					b = (b << 1) | oddBit
 				} else {
-					bit = evenBit
+					b = (b << 1) | evenBit
 				}
-
-				b = (b << 1) | bit
 			}
 
-			p[n] = b
-			n++
+			out[i] = b
 		}
+
+		n += outCount
 	}
 
 	return n, nil
