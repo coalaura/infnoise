@@ -19,15 +19,19 @@ const (
 	sioReset       = 0x00
 	sioSetBaudRate = 0x03
 	sioSetBitMode  = 0x0B
+	sioSetLatency  = 0x09
 	sioResetSio    = 0x0000
 	sioPurgeRx     = 0x0001
 	sioPurgeTx     = 0x0002
-	reqOutVendor   = 0x40
-	defaultTO      = 5000
-	epInAddr       = 0x81
-	epOutAddr      = 0x02
 
-	ioChunkSize = 512
+	reqOutVendor = 0x40
+
+	defaultTimeoutMS = 5000
+	defaultIface     = 0
+	epInAddr         = 0x81
+	epOutAddr        = 0x02
+
+	transferChunk = 512
 )
 
 type usbHandle struct {
@@ -39,14 +43,17 @@ type usbHandle struct {
 	epOut C.uchar
 
 	maxPacket int
-	rawBuf    []byte
-	rx        []byte
-	rxHead    int
-	rxTail    int
+
+	rawBuf []byte
+	rxBuf  []byte
 }
 
 func openUSB(vid, pid uint16) (*usbHandle, error) {
-	h := &usbHandle{}
+	h := &usbHandle{
+		iface: defaultIface,
+		epIn:  C.uchar(epInAddr),
+		epOut: C.uchar(epOutAddr),
+	}
 
 	st := C.libusb_init(&h.ctx)
 	if st != 0 {
@@ -69,10 +76,6 @@ func openUSB(vid, pid uint16) (*usbHandle, error) {
 		return nil, usbErr(st)
 	}
 
-	h.iface = 0
-	h.epIn = C.uchar(epInAddr)
-	h.epOut = C.uchar(epOutAddr)
-
 	st = C.libusb_claim_interface(h.devh, C.int(h.iface))
 	if st != 0 {
 		h.close()
@@ -81,17 +84,33 @@ func openUSB(vid, pid uint16) (*usbHandle, error) {
 	}
 
 	h.maxPacket = 64
-	h.rawBuf = make([]byte, 8192)
-	h.rx = make([]byte, 32768)
+
+	dev := C.libusb_get_device(h.devh)
+	if dev != nil {
+		mps := int(C.libusb_get_max_packet_size(dev, h.epIn))
+		if mps > 0 {
+			h.maxPacket = mps
+		}
+	}
+
+	h.rawBuf = make([]byte, 4096)
+
+	h.rxBuf = make([]byte, 0, 64*1024)
 
 	h.ctrlOut(sioReset, sioResetSio)
 	h.ctrlOut(sioReset, sioPurgeRx)
 	h.ctrlOut(sioReset, sioPurgeTx)
 	h.ctrlOut(sioSetBitMode, 0)
+	h.ctrlOut(sioSetLatency, 2)
 
 	time.Sleep(10 * time.Millisecond)
 
-	h.setBaudRate(30000)
+	err := h.setBaudRate(30000)
+	if err != nil {
+		h.close()
+
+		return nil, err
+	}
 
 	return h, nil
 }
@@ -104,30 +123,63 @@ func (h *usbHandle) setBitMode(mask byte, mode byte) error {
 		return err
 	}
 
-	h.rxHead = 0
-	h.rxTail = 0
+	h.ctrlOut(sioReset, sioPurgeRx)
+	h.ctrlOut(sioReset, sioPurgeTx)
+
+	h.rxBuf = h.rxBuf[:0]
 
 	return nil
 }
 
 func (h *usbHandle) write(data []byte) error {
-	for i := 0; i < len(data); i += ioChunkSize {
-		end := i + ioChunkSize
+	if len(data) > 0 && len(h.rxBuf) > 0 {
+		h.rxBuf = h.rxBuf[:0]
+	}
 
-		if end > len(data) {
-			end = len(data)
-		}
+	for off := 0; off < len(data); off += transferChunk {
+		end := min(off+transferChunk, len(data))
+
+		chunkLen := end - off
 
 		var xfer C.int
 
-		st := C.libusb_bulk_transfer(h.devh, h.epOut, (*C.uchar)(unsafe.Pointer(&data[i])), C.int(end-i), &xfer, defaultTO)
+		st := C.libusb_bulk_transfer(
+			h.devh, h.epOut,
+			(*C.uchar)(unsafe.Pointer(&data[off])),
+			C.int(chunkLen),
+			&xfer,
+			defaultTimeoutMS,
+		)
+
 		if st != 0 {
 			return usbErr(st)
 		}
 
-		err := h.fillRX(h.available() + int(xfer))
-		if err != nil {
-			return err
+		neededPayload := chunkLen
+
+		for neededPayload > 0 {
+			st = C.libusb_bulk_transfer(
+				h.devh, h.epIn,
+				(*C.uchar)(unsafe.Pointer(&h.rawBuf[0])),
+				C.int(len(h.rawBuf)),
+				&xfer,
+				defaultTimeoutMS,
+			)
+
+			if st != 0 {
+				return usbErr(st)
+			}
+
+			nRaw := int(xfer)
+			if nRaw == 0 {
+				continue
+			}
+
+			payloadBytes := h.extractPayload(h.rawBuf[:nRaw])
+
+			h.rxBuf = append(h.rxBuf, payloadBytes...)
+
+			neededPayload -= len(payloadBytes)
 		}
 	}
 
@@ -135,62 +187,45 @@ func (h *usbHandle) write(data []byte) error {
 }
 
 func (h *usbHandle) read(dst []byte) error {
-	err := h.fillRX(len(dst))
-	if err != nil {
-		return err
+	if len(dst) == 0 {
+		return nil
 	}
 
-	copy(dst, h.rx[h.rxHead:h.rxHead+len(dst)])
+	if len(h.rxBuf) < len(dst) {
+		return fmt.Errorf("read underrun: want %d bytes, have %d (device sync lost?)", len(dst), len(h.rxBuf))
+	}
 
-	h.rxHead += len(dst)
+	copy(dst, h.rxBuf[:len(dst)])
+
+	if len(dst) == len(h.rxBuf) {
+		h.rxBuf = h.rxBuf[:0]
+	} else {
+		copy(h.rxBuf, h.rxBuf[len(dst):])
+		h.rxBuf = h.rxBuf[:len(h.rxBuf)-len(dst)]
+	}
 
 	return nil
 }
 
-func (h *usbHandle) available() int {
-	return h.rxTail - h.rxHead
-}
-
-func (h *usbHandle) fillRX(n int) error {
-	for h.available() < n {
-		if h.rxHead > (len(h.rx) / 2) {
-			copy(h.rx, h.rx[h.rxHead:h.rxTail])
-
-			h.rxTail -= h.rxHead
-			h.rxHead = 0
-		}
-
-		var xfer C.int
-
-		st := C.libusb_bulk_transfer(h.devh, h.epIn, (*C.uchar)(unsafe.Pointer(&h.rawBuf[0])), C.int(len(h.rawBuf)), &xfer, defaultTO)
-		if st != 0 {
-			return usbErr(st)
-		}
-
-		nraw := int(xfer)
-		mps := h.maxPacket
-
-		for off := 0; off < nraw; off += mps {
-			sz := mps
-			if nraw-off < sz {
-				sz = nraw - off
-			}
-
-			if sz > 2 {
-				payloadLen := sz - 2
-
-				if h.rxTail+payloadLen > len(h.rx) {
-					return fmt.Errorf("rx buffer overflow")
-				}
-
-				copy(h.rx[h.rxTail:], h.rawBuf[off+2:off+sz])
-
-				h.rxTail += payloadLen
-			}
-		}
+func (h *usbHandle) extractPayload(raw []byte) []byte {
+	if len(raw) < 2 {
+		return nil
 	}
 
-	return nil
+	mps := h.maxPacket
+	dest := raw[:0]
+
+	for off := 0; off < len(raw); off += mps {
+		chunkEnd := min(off+mps, len(raw))
+
+		if chunkEnd-off <= 2 {
+			continue
+		}
+
+		dest = append(dest, raw[off+2:chunkEnd]...)
+	}
+
+	return dest
 }
 
 func (h *usbHandle) close() error {
@@ -199,17 +234,27 @@ func (h *usbHandle) close() error {
 
 		C.libusb_release_interface(h.devh, C.int(h.iface))
 		C.libusb_close(h.devh)
+
+		h.devh = nil
 	}
 
 	if h.ctx != nil {
 		C.libusb_exit(h.ctx)
+
+		h.ctx = nil
 	}
 
 	return nil
 }
 
 func (h *usbHandle) ctrlOut(req uint8, val uint16) error {
-	st := C.libusb_control_transfer(h.devh, reqOutVendor, C.uint8_t(req), C.uint16_t(val), 1, nil, 0, defaultTO)
+	idx := uint16(h.iface + 1)
+
+	st := C.libusb_control_transfer(
+		h.devh, reqOutVendor, C.uint8_t(req), C.uint16_t(val), C.uint16_t(idx),
+		nil, 0, defaultTimeoutMS,
+	)
+
 	if st < 0 {
 		return usbErr(C.int(st))
 	}
