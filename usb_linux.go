@@ -112,7 +112,7 @@ func openUSB(vid, pid uint16) (*usbHandle, error) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	err = h.setBaudRate(30000)
+	err := h.setBaudRate(30000)
 	if err != nil {
 		h.close()
 		return nil, err
