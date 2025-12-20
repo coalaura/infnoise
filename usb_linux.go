@@ -4,8 +4,12 @@
 package infnoise
 
 /*
-#cgo linux pkg-config: libusb-1.0
-#include <libusb-1.0/libusb.h>
+#cgo CFLAGS: -I./include
+
+#cgo linux,amd64 LDFLAGS: ${SRCDIR}/lib/linux_amd64/libusb-1.0.a -lpthread -lrt
+#cgo linux,arm64 LDFLAGS: ${SRCDIR}/lib/linux_arm64/libusb-1.0.a -lpthread -lrt
+
+#include <libusb.h>
 */
 import "C"
 
