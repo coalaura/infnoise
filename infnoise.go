@@ -2,6 +2,7 @@ package infnoise
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 
 	"golang.org/x/crypto/sha3"
@@ -32,6 +33,7 @@ const (
 type Device struct {
 	mu      sync.Mutex
 	usbDev  *usbHandle
+	health  *HealthCheck
 	running bool
 
 	outPattern []byte
@@ -47,8 +49,24 @@ type Device struct {
 }
 
 // New initializes a new Infinite Noise device with default internal buffers.
-func New() *Device {
+func New(opts ...option) *Device {
+	conf := &options{
+		targetEntropy: 0.864,
+		tolerance:     0.05,
+		window:        80000,
+	}
+
+	for _, opt := range opts {
+		opt(conf)
+	}
+
 	d := &Device{
+		health: &HealthCheck{
+			TargetEntropy: conf.targetEntropy,
+			Tolerance:     conf.tolerance,
+			window:        conf.window,
+		},
+
 		outPattern: make([]byte, BufLen),
 		outBulk:    make([]byte, IOBatch),
 		inBulk:     make([]byte, IOBatch),
@@ -220,6 +238,10 @@ func (d *Device) readRawLocked(p []byte) (n int, err error) {
 			}
 
 			out[i] = b
+		}
+
+		if !d.health.Add(p[n : n+outCount]) {
+			return n, fmt.Errorf("hardware health check failed: entropy %0.4f outside tolerance", d.health.EstimatedEntropy())
 		}
 
 		n += outCount
