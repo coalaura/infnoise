@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-
-	"golang.org/x/crypto/sha3"
 )
 
 const (
@@ -39,13 +37,6 @@ type Device struct {
 	outPattern []byte
 	outBulk    []byte
 	inBulk     []byte
-
-	sponge sha3.ShakeHash
-
-	pool        []byte
-	poolBuf     []byte
-	rawPool     []byte
-	rawFetchBuf []byte
 }
 
 // New initializes a new Infinite Noise device with default internal buffers.
@@ -70,11 +61,6 @@ func New(opts ...option) *Device {
 		outPattern: make([]byte, BufLen),
 		outBulk:    make([]byte, IOBatch),
 		inBulk:     make([]byte, IOBatch),
-
-		sponge:      sha3.NewCShake256(nil, []byte("infnoise")),
-		poolBuf:     make([]byte, WhitenedChunkSize),
-		rawPool:     make([]byte, 0, WhitenedChunkSize),
-		rawFetchBuf: make([]byte, WhitenedChunkSize),
 	}
 
 	for i := range BufLen {
@@ -117,79 +103,11 @@ func (d *Device) Start() error {
 	return nil
 }
 
-// Read implements io.Reader, filling p with cryptographically whitened entropy.
+// Read fills p with the direct bitstream from the hardware.
 func (d *Device) Read(p []byte) (n int, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if !d.running {
-		return 0, errors.New("device not started")
-	}
-
-	for n < len(p) {
-		// 1. Drain whitened pool
-		if len(d.pool) > 0 {
-			todo := min(len(d.pool), len(p)-n)
-
-			copy(p[n:], d.pool[:todo])
-			d.pool = d.pool[todo:]
-
-			n += todo
-
-			continue
-		}
-
-		rawNeeded := WhitenedChunkSize - len(d.rawPool)
-		if rawNeeded > 0 {
-			rn, rerr := d.readRawLocked(d.rawFetchBuf[:rawNeeded])
-			if rerr != nil {
-				return n, rerr
-			}
-
-			d.rawPool = append(d.rawPool, d.rawFetchBuf[:rn]...)
-		}
-
-		if len(d.rawPool) >= WhitenedChunkSize {
-			d.sponge.Write(d.rawPool[:WhitenedChunkSize])
-
-			clone := d.sponge.Clone()
-			clone.Read(d.poolBuf)
-
-			d.rawPool = d.rawPool[:0]
-			d.pool = d.poolBuf
-		}
-	}
-
-	return n, nil
-}
-
-// ReadRaw fills p with the direct, unwhitened bitstream from the hardware.
-func (d *Device) ReadRaw(p []byte) (n int, err error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	return d.readRawLocked(p)
-}
-
-// Close stops the device and releases the underlying USB handle.
-func (d *Device) Close() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	d.running = false
-
-	if d.usbDev != nil {
-		err := d.usbDev.close()
-
-		d.usbDev = nil
-
-		return err
-	}
-
-	return nil
-}
-
-func (d *Device) readRawLocked(p []byte) (n int, err error) {
 	if !d.running {
 		return 0, errors.New("device not started")
 	}
@@ -248,6 +166,24 @@ func (d *Device) readRawLocked(p []byte) (n int, err error) {
 	}
 
 	return n, nil
+}
+
+// Close stops the device and releases the underlying USB handle.
+func (d *Device) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.running = false
+
+	if d.usbDev != nil {
+		err := d.usbDev.close()
+
+		d.usbDev = nil
+
+		return err
+	}
+
+	return nil
 }
 
 func makeAddress(addr uint8) uint8 {

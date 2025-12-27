@@ -29,40 +29,28 @@ func openDevice(t testing.TB) *Device {
 	return dv
 }
 
-func TestReadRaw(t *testing.T) {
-	dv := openDevice(t)
-
-	runEntropyTest(t, dv.ReadRaw, "raw")
-}
-
 func TestRead(t *testing.T) {
 	dv := openDevice(t)
-
-	runEntropyTest(t, dv.Read, "whitened")
-}
-
-func runEntropyTest(t *testing.T, readFn func([]byte) (int, error), label string) {
-	t.Helper()
 
 	buf1 := make([]byte, testBytes)
 	buf2 := make([]byte, testBytes)
 
-	n, err := readFn(buf1)
+	n, err := dv.Read(buf1)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if n != len(buf1) {
-		t.Fatalf("%s: read only %d bytes, want %d", label, n, len(buf1))
+		t.Fatalf("read only %d bytes, want %d", n, len(buf1))
 	}
 
-	n, err = readFn(buf2)
+	n, err = dv.Read(buf2)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if n != len(buf2) {
-		t.Fatalf("%s: read only %d bytes, want %d", label, n, len(buf2))
+		t.Fatalf("read only %d bytes, want %d", n, len(buf2))
 	}
 
 	var (
@@ -82,51 +70,34 @@ func runEntropyTest(t *testing.T, readFn func([]byte) (int, error), label string
 		ones += bits.OnesCount8(buf1[i])
 	}
 
-	if len(unique) < 200 && label == "whitened" {
-		t.Fatalf("%s: too few unique byte values (%d); whitening failed", label, len(unique))
-	} else if len(unique) < 8 {
-		t.Fatalf("%s: too few unique byte values (%d); device stuck", label, len(unique))
+	if len(unique) < 8 {
+		t.Fatalf("too few unique byte values (%d); device stuck", len(unique))
 	}
 
 	eqFrac := float64(sameAsFirst) / float64(testBytes)
 	if eqFrac > 0.05 {
-		t.Fatalf("%s: consecutive blocks too similar: %.2f%% (want < 5%%)", label, 100*eqFrac)
+		t.Fatalf("consecutive blocks too similar: %.2f%% (want < 5%%)", 100*eqFrac)
 	}
 
 	totalBits := float64(testBytes * 8)
 	oneFrac := float64(ones) / totalBits
 
 	low, high := 0.45, 0.55
-	if label == "whitened" {
-		low, high = 0.49, 0.51
-	}
 
 	if oneFrac < low || oneFrac > high {
-		t.Fatalf("%s: bit bias suspicious: ones fraction %.4f (want [%.2f, %.2f])", label, oneFrac, low, high)
+		t.Fatalf("bit bias suspicious: ones fraction %.4f (want [%.2f, %.2f])", oneFrac, low, high)
 	}
 
-	t.Logf("%s stats: uniqueBytes=%d ones=%.2f%% eqPos=%.2f%%", label, len(unique), 100*oneFrac, 100*eqFrac)
-}
-
-func BenchmarkReadRawThroughput(b *testing.B) {
-	dv := openDevice(b)
-
-	runBenchmark(b, dv.ReadRaw)
+	t.Logf("tats: uniqueBytes=%d ones=%.2f%% eqPos=%.2f%%", len(unique), 100*oneFrac, 100*eqFrac)
 }
 
 func BenchmarkReadThroughput(b *testing.B) {
 	dv := openDevice(b)
 
-	runBenchmark(b, dv.Read)
-}
-
-func runBenchmark(b *testing.B, readFn func([]byte) (int, error)) {
-	b.Helper()
-
 	buf := make([]byte, testChunk)
 
 	for range 3 {
-		n, err := readFn(buf)
+		n, err := dv.Read(buf)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -141,7 +112,7 @@ func runBenchmark(b *testing.B, readFn func([]byte) (int, error)) {
 	b.ResetTimer()
 
 	for b.Loop() {
-		n, err := readFn(buf)
+		n, err := dv.Read(buf)
 		if err != nil {
 			b.Fatal(err)
 		}
